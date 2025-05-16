@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+
+# Importing essential modules for operation
+import math as mathematical_operations
+import sys as system_interface
+import time as time_management
+from easysnmp import Session as SNMP_Session
+from easysnmp.exceptions import EasySNMPTimeoutError as SNMP_Timeout
+
+# Retrieve target system details from command line input
+target_info = system_interface.argv[1]
+target_ip, target_port, access_string = target_info.split(':')
+poll_rate = float(system_interface.argv[2])
+poll_period = 1 / poll_rate
+sample_count = int(system_interface.argv[3])
+object_identifiers = ['1.3.6.1.2.1.1.3.0'] + system_interface.argv[4:]
+
+def fetch_snmp_data(current_session, loop_index, prior_values, last_uptime, last_query_time):
+    now = time_management.time()
+
+    try:
+        response_data = current_session.get(object_identifiers)
+    except SNMP_Timeout:
+        print(f"{int(now)}|TIMEOUT|")
+        return prior_values, last_uptime, last_query_time
+
+    # Process system up-time (first OID)
+    try:
+        current_uptime_value = int(response_data[0].value)
+    except ValueError:
+        print(f"{int(now)}|INVALID_UPTIME|")
+        return prior_values, last_uptime, last_query_time
+
+    # Detect agent restarts by comparing current and previous uptime
+    if last_uptime is not None and current_uptime_value < last_uptime:
+        print(f"{int(now)}|AGENT_RESTARTED|")
+        return [], current_uptime_value, now
+
+    # Process counter readings (remaining OIDs)
+    current_readings = []
+    for item in response_data[1:]:
+        if item.value not in ('NOSUCHOBJECT', 'NOSUCHINSTANCE'):
+            current_readings.append(int(item.value))
+
+    # Calculate rates of change if previous readings exist
+    if loop_index > 0 and prior_values:
+        duration = round(now - last_query_time, 1)
+        computed_rates = []
+
+        for index in range(len(current_readings)):
+            if index >= len(prior_values):
+                continue
+
+            difference = current_readings[index] - prior_values[index]
+
+            # Handle potential counter wrap-around
+            if difference < 0:
+                rollover_limit = 2**32 if response_data[index+1].snmp_type == 'COUNTER32' else 2**64
+                difference += rollover_limit
+
+            rate_per_second = int(difference / duration)
+            computed_rates.append(str(max(rate_per_second, 0)))
+
+        if computed_rates:
+            print(f"{int(now)}|{'|'.join(computed_rates)}|")
+
+    return current_readings, current_uptime_value, now
+
+# Main function for continuous polling
+def main_polling_process():
+    snmp_session = SNMP_Session(hostname=target_ip, remote_port=target_port,
+                                 community=access_string, version=2, timeout=1, retries=1)
+
+    previous_readings = []
+    previous_uptime_value = None
+    iteration_count = 0
+    last_poll_timestamp = time_management.time()
+
+    while sample_count == -1 or iteration_count <= sample_count:
+        current_timestamp = time_management.time()
+        previous_readings, previous_uptime_value, last_poll_timestamp = fetch_snmp_data(
+            snmp_session, iteration_count, previous_readings, previous_uptime_value, last_poll_timestamp)
+
+        iteration_count += 1
+
+        # Introduce a delay to maintain the desired polling interval
+        finish_time = time_management.time()
+        sleep_duration = max(0, poll_period - (finish_time - current_timestamp))
+        time_management.sleep(sleep_duration)
+
+if __name__ == "__main__":
+    main_polling_process()
